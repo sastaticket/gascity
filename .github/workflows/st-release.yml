@@ -1,0 +1,106 @@
+name: st release
+
+# Sastaticket's pinned gc builds. A tag st-YYYYMMDD-<upstream-sha12> on the
+# st/release branch (upstream main merged in, plus any Sastaticket-only commits)
+# publishes a pre-release with the goreleaser archives for darwin and linux,
+# their checksums and a build-provenance attestation. Laptops install from that
+# pre-release with st/install-gc.sh, so every city runs the same binary.
+#
+# Upstream's own release workflows react only to v* tags and are guarded to
+# gastownhall/gascity; never push a v* tag to this fork. See st/README.md.
+
+on:
+  push:
+    tags: ["st-*"]
+
+permissions: {}
+
+concurrency:
+  group: st-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish ${{ github.ref_name }}
+    if: ${{ github.repository == 'sastaticket/gascity' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Check the tag and find the upstream base
+        id: base
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! printf '%s' "$tag" | grep -Eq '^st-[0-9]{8}-[0-9a-f]{12}(\.[0-9]+)?$'; then
+            echo "ERROR: tag $tag is not st-YYYYMMDD-<upstream-sha12>[.N]" >&2
+            exit 1
+          fi
+          git remote add upstream https://github.com/gastownhall/gascity.git
+          git fetch --quiet --no-tags upstream main
+          base="$(git merge-base HEAD upstream/main)"
+          named="$(printf '%s' "$tag" | sed -E 's/^st-[0-9]{8}-([0-9a-f]{12}).*$/\1/')"
+          if [ "${base:0:12}" != "$named" ]; then
+            echo "ERROR: tag names upstream $named but the tagged commit's upstream base is ${base:0:12}" >&2
+            exit 1
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+
+      # Snapshot mode reuses upstream's release build config (CGO_ENABLED=0,
+      # ldflags, archive layout) without publishing to upstream's channels.
+      # gc version prints the tag; product metrics classify it as a canary.
+      - name: Build archives
+        uses: goreleaser/goreleaser-action@1a80836c5c9d9e5755a25cb59ec6f45a3b5f41a8 # v7
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean
+        env:
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+
+      - name: Verify the binary names this commit and tag
+        run: |
+          set -euo pipefail
+          scripts/verify-release-binary-metadata.sh \
+            dist/gascity_linux_amd64_v1/gc \
+            "$(git rev-parse HEAD)" \
+            "${GITHUB_REF_NAME}"
+          ls dist/*.tar.gz "dist/gascity_${GITHUB_REF_NAME}_checksums.txt"
+
+      - name: Attest the archives
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-checksums: dist/gascity_${{ github.ref_name }}_checksums.txt
+
+      - name: Publish the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ steps.base.outputs.base }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          {
+            echo "Sastaticket gc build \`${tag}\`."
+            echo
+            echo "- Upstream base: gastownhall/gascity@${BASE}"
+            echo "- Tagged commit: ${GITHUB_SHA}"
+            echo
+            echo "Commits on top of upstream (excluding merges):"
+            echo
+            git log --no-merges --format='- %h %s' "${BASE}..HEAD"
+            echo
+            echo "Install on a Mac: \`sh st/install-gc.sh ${tag}\` from a clone of this repository."
+            echo "Verify provenance: \`gh attestation verify <archive> --repo ${GITHUB_REPOSITORY}\`."
+          } > notes.md
+          gh release create "$tag" --prerelease --verify-tag \
+            --title "gc ${tag}" --notes-file notes.md \
+            dist/*.tar.gz "dist/gascity_${tag}_checksums.txt"
