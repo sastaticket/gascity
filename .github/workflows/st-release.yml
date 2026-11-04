@@ -101,6 +101,8 @@ jobs:
             echo "Install on a Mac: \`sh st/install-gc.sh ${tag}\` from a clone of this repository."
             echo "Verify provenance: \`gh attestation verify <archive> --repo ${GITHUB_REPOSITORY}\`."
           } > notes.md
-          gh release create "$tag" --prerelease --verify-tag \
+          # --repo is required: gh would otherwise resolve the `upstream`
+          # remote added above and look for the tag on gastownhall/gascity.
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --verify-tag \
             --title "gc ${tag}" --notes-file notes.md \
             dist/*.tar.gz "dist/gascity_${tag}_checksums.txt"
