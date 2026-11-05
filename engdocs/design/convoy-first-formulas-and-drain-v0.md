@@ -212,7 +212,8 @@ The control dispatcher processes `gc.kind = "drain"` beads.
 Expansion flow:
 
 1. Read the graph.v2 workflow root from `gc.root_bead_id`.
-2. Read the parent input convoy from the root's `gc.input_convoy_id`.
+2. Read the parent convoy from the root's `gc.drain_convoy_id`, falling back
+   to its `gc.input_convoy_id` when that is unset.
 3. If `gc.drain_manifest.v1` already exists, replay that persisted snapshot.
 4. Otherwise list active convoy members, excluding closed members.
 5. Reject unresolved or cross-store tracked members.
