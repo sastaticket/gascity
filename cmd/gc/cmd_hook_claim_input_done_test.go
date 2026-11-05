@@ -566,3 +566,74 @@ func TestWorkflowOutlivesTheConvoyItsDrainScatters(t *testing.T) {
 		t.Fatal("workflowInputDone = false after the source work closed, want true")
 	}
 }
+
+// TestOldPackRepointingInputConvoyStillRetiresWorkflowEarly pins the failure
+// shape the engine fix alone does not cure. A pack that still re-points the
+// workflow root's gc.input_convoy_id at the convoy it minted mid-run (instead of
+// setting gc.drain_convoy_id) gets its drain through the fallback, but the claim
+// hook then reads that convoy as the work the workflow serves: once its tasks
+// close, workflowInputDone reports the workflow done while the gate after the
+// drain is still open, so the hook retires the run and skips every later step
+// (kr-5dq). The pack must stop re-pointing the input key; this test records why.
+func TestOldPackRepointingInputConvoyStillRetiresWorkflowEarly(t *testing.T) {
+	store := beads.NewMemStore()
+	mustCreate := func(b beads.Bead) beads.Bead {
+		t.Helper()
+		created, err := store.Create(b)
+		if err != nil {
+			t.Fatalf("create %q: %v", b.Title, err)
+		}
+		return created
+	}
+	track := func(convoyID, itemID string) {
+		t.Helper()
+		if err := convoy.TrackItemIn(convoy.MemberClasses{Convoy: beadstest.Work(store)}, convoyID, itemID); err != nil {
+			t.Fatalf("track %s in %s: %v", itemID, convoyID, err)
+		}
+	}
+
+	source := mustCreate(beads.Bead{Title: "the change", Type: "task"})
+	input := mustCreate(beads.Bead{Title: "input convoy", Type: "convoy", Metadata: map[string]string{beadmeta.SyntheticMetadataKey: "true"}})
+	track(input.ID, source.ID)
+	root := mustCreate(beads.Bead{Title: "deliver", Type: "task", Metadata: map[string]string{
+		beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+		beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		beadmeta.InputConvoyIDMetadataKey:   input.ID,
+		beadmeta.RoutedToMetadataKey:        "rig/worker",
+	}})
+
+	// The old pack's decompose: mint the implementation convoy and re-point
+	// the input key at it so the drain can find it.
+	implementation := mustCreate(beads.Bead{Title: "implementation", Type: "convoy"})
+	var taskIDs []string
+	for _, title := range []string{"task one", "task two"} {
+		task := mustCreate(beads.Bead{Title: title, Type: "task"})
+		track(implementation.ID, task.ID)
+		taskIDs = append(taskIDs, task.ID)
+	}
+	if err := store.SetMetadata(root.ID, beadmeta.InputConvoyIDMetadataKey, implementation.ID); err != nil {
+		t.Fatalf("re-point gc.input_convoy_id: %v", err)
+	}
+	gate := mustCreate(beads.Bead{Title: "gate", Type: "task", Metadata: map[string]string{
+		beadmeta.RootBeadIDMetadataKey: root.ID,
+		beadmeta.RoutedToMetadataKey:   "rig/worker",
+	}})
+
+	for _, id := range taskIDs {
+		if err := store.Close(id); err != nil {
+			t.Fatalf("close %s: %v", id, err)
+		}
+	}
+
+	if got := beadByID(t, store, gate.ID).Status; got != "open" {
+		t.Fatalf("gate status = %q, want open: the step after the drain has not run", got)
+	}
+	if got := beadByID(t, store, source.ID).Status; got != "open" {
+		t.Fatalf("source status = %q, want open: the work served is not done", got)
+	}
+	if _, done, err := workflowInputDone(beadstest.Work(store), gate, nil); err != nil {
+		t.Fatalf("workflowInputDone(gate): %v", err)
+	} else if !done {
+		t.Fatal("workflowInputDone = false; the old pack's re-pointed input convoy no longer retires the run early, so this failure shape is gone and the test should be revisited")
+	}
+}
