@@ -5,6 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -12,6 +15,8 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/beadstest"
 	"github.com/gastownhall/gascity/internal/convoy"
+	"github.com/gastownhall/gascity/internal/dispatch"
+	"github.com/gastownhall/gascity/internal/formulatest"
 )
 
 // seedDoneWorkflow builds a store holding a workflow root whose input convoy
@@ -441,5 +446,123 @@ func TestDoHookClaimStillClaimsWhenInputNotDone(t *testing.T) {
 	}
 	if claimedID != "root-1" {
 		t.Fatalf("claimed = %q, want root-1", claimedID)
+	}
+}
+
+// TestWorkflowOutlivesTheConvoyItsDrainScatters is the decompose-then-drain
+// workflow shape: the run is slung on a source bead (its input convoy tracks
+// that bead), a decompose step mints an implementation convoy mid-run, a drain
+// fans that convoy out, and gate and review steps run after the drain.
+//
+// The drain must scatter the implementation convoy, and the run must survive
+// that convoy closing: the claim hook retires a workflow once its input
+// convoy's work is terminal, and convoy autoclose reaps a root through the
+// same key. A pack that re-pointed gc.input_convoy_id at the implementation
+// convoy so the drain could find it had every step after the drain closed
+// skipped ("input convoy work already terminal") the moment the last task
+// closed. gc.drain_convoy_id names the convoy to drain without touching the
+// input, so the run lives until the source work itself is done.
+func TestWorkflowOutlivesTheConvoyItsDrainScatters(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	formulaDir := t.TempDir()
+	itemFormula := "formula = \"drain-item\"\nversion = 1\ncontract = \"graph.v2\"\ntype = \"workflow\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work {{convoy_id}}\"\n"
+	if err := os.WriteFile(filepath.Join(formulaDir, "drain-item.formula.toml"), []byte(itemFormula), 0o644); err != nil {
+		t.Fatalf("write drain item formula: %v", err)
+	}
+	store := beads.NewMemStore()
+	mustCreate := func(b beads.Bead) beads.Bead {
+		t.Helper()
+		created, err := store.Create(b)
+		if err != nil {
+			t.Fatalf("create %q: %v", b.Title, err)
+		}
+		return created
+	}
+	track := func(convoyID, itemID string) {
+		t.Helper()
+		if err := convoy.TrackItemIn(convoy.MemberClasses{Convoy: beadstest.Work(store)}, convoyID, itemID); err != nil {
+			t.Fatalf("track %s in %s: %v", itemID, convoyID, err)
+		}
+	}
+	closeBead := func(id string) {
+		t.Helper()
+		if err := store.Close(id); err != nil {
+			t.Fatalf("close %s: %v", id, err)
+		}
+	}
+
+	source := mustCreate(beads.Bead{Title: "the change", Type: "task"})
+	input := mustCreate(beads.Bead{Title: "input convoy", Type: "convoy", Metadata: map[string]string{beadmeta.SyntheticMetadataKey: "true"}})
+	track(input.ID, source.ID)
+	root := mustCreate(beads.Bead{Title: "deliver", Type: "task", Metadata: map[string]string{
+		beadmeta.KindMetadataKey:            beadmeta.KindWorkflow,
+		beadmeta.FormulaContractMetadataKey: beadmeta.FormulaContractGraphV2,
+		beadmeta.InputConvoyIDMetadataKey:   input.ID,
+		beadmeta.RoutedToMetadataKey:        "rig/worker",
+	}})
+
+	// Decompose: mint the implementation convoy and point the drain at it.
+	implementation := mustCreate(beads.Bead{Title: "implementation", Type: "convoy"})
+	var taskIDs []string
+	for _, title := range []string{"task one", "task two"} {
+		task := mustCreate(beads.Bead{Title: title, Type: "task"})
+		track(implementation.ID, task.ID)
+		taskIDs = append(taskIDs, task.ID)
+	}
+	if err := store.SetMetadata(root.ID, beadmeta.DrainConvoyIDMetadataKey, implementation.ID); err != nil {
+		t.Fatalf("set gc.drain_convoy_id: %v", err)
+	}
+
+	drain := mustCreate(beads.Bead{Title: "implement", Type: "task", Metadata: map[string]string{
+		beadmeta.KindMetadataKey:       "drain",
+		beadmeta.RootBeadIDMetadataKey: root.ID,
+		"gc.drain_context":             "separate",
+		"gc.drain_formula":             "drain-item",
+		"gc.drain_member_access":       "read",
+	}})
+	gate := mustCreate(beads.Bead{Title: "gate", Type: "task", Metadata: map[string]string{
+		beadmeta.RootBeadIDMetadataKey: root.ID,
+		beadmeta.RoutedToMetadataKey:   "rig/worker",
+	}})
+
+	if _, err := dispatch.ProcessControl(beadstest.Graph(store), drain, dispatch.ProcessOptions{
+		Work:               beadstest.Work(store),
+		FormulaSearchPaths: []string{formulaDir},
+	}); err != nil {
+		t.Fatalf("ProcessControl(drain): %v", err)
+	}
+	var drained []string
+	for _, row := range parseDrainManifestRows(t, beadByID(t, store, drain.ID).Metadata[beadmeta.DrainManifestMetadataKey]) {
+		drained = append(drained, row.MemberID)
+	}
+	slices.Sort(drained)
+	slices.Sort(taskIDs)
+	if !slices.Equal(drained, taskIDs) {
+		t.Fatalf("drain scattered %v, want the implementation tasks %v (source %s)", drained, taskIDs, source.ID)
+	}
+
+	// Implementation lands: every task closes and the convoy autocloses.
+	for _, id := range taskIDs {
+		closeBead(id)
+	}
+	closeBead(implementation.ID)
+
+	if _, done, err := workflowInputDone(beadstest.Work(store), gate, nil); err != nil {
+		t.Fatalf("workflowInputDone(gate): %v", err)
+	} else if done {
+		t.Fatal("the claim hook would retire the workflow once its drained convoy closed; the gate and every later step would be skipped")
+	}
+	for _, reaped := range collectInputConvoyWorkflowRoots(store, store, beadByID(t, store, taskIDs[0]), map[string]bool{}) {
+		if reaped.ID == root.ID {
+			t.Fatalf("convoy autoclose would reap workflow %s when an implementation task closed", root.ID)
+		}
+	}
+
+	// The source work finishing still retires the run, as before.
+	closeBead(source.ID)
+	if _, done, err := workflowInputDone(beadstest.Work(store), gate, nil); err != nil {
+		t.Fatalf("workflowInputDone(gate) after the source closed: %v", err)
+	} else if !done {
+		t.Fatal("workflowInputDone = false after the source work closed, want true")
 	}
 }

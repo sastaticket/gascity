@@ -362,6 +362,114 @@ func TestProcessDrainSeparateSucceedsForEmptyInputConvoy(t *testing.T) {
 	}
 }
 
+// TestProcessDrainScattersDrainConvoyIDWhenSet pins that a drain scatters the
+// root's gc.drain_convoy_id when it is set, not gc.input_convoy_id. A workflow
+// that mints its work list mid-run (a decompose step's implementation convoy)
+// points the drain there and leaves gc.input_convoy_id naming the work the run
+// serves. Re-pointing the input instead made the claim hook retire the run as
+// soon as that convoy's tasks closed, skipping every step after the drain.
+func TestProcessDrainScattersDrainConvoyIDWhenSet(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeDrainItemFormula(t, dir)
+	store, drain := seedDrainWorkflow(t)
+	rootID := drain.Metadata["gc.root_bead_id"]
+	inputConvoyID := mustGetBead(t, store, rootID).Metadata["gc.input_convoy_id"]
+
+	implementation, err := store.Create(beads.Bead{Title: "implementation", Type: "convoy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var taskIDs []string
+	for _, title := range []string{"task one", "task two", "task three"} {
+		task, err := store.Create(beads.Bead{Title: title, Type: "task"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := convoycore.TrackItemIn(convoycore.MemberClasses{Convoy: beadstest.Work(store)}, implementation.ID, task.ID); err != nil {
+			t.Fatal(err)
+		}
+		taskIDs = append(taskIDs, task.ID)
+	}
+	if err := store.SetMetadata(rootID, beadmeta.DrainConvoyIDMetadataKey, implementation.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := ProcessControl(beadstest.Graph(store), drain, ProcessOptions{Work: beadstest.Work(store), FormulaSearchPaths: []string{dir}}); err != nil {
+		t.Fatalf("ProcessControl(drain expand): %v", err)
+	}
+	drain = mustGetBead(t, store, drain.ID)
+	manifest := mustDrainManifest(t, drain)
+	if manifest.ParentConvoyID != implementation.ID {
+		t.Fatalf("manifest parent convoy = %q, want gc.drain_convoy_id %q (input convoy is %q)", manifest.ParentConvoyID, implementation.ID, inputConvoyID)
+	}
+	if got := drain.Metadata[beadmeta.DrainParentConvoyIDMetadataKey]; got != implementation.ID {
+		t.Fatalf("gc.drain_parent_convoy_id = %q, want %q", got, implementation.ID)
+	}
+	var members []string
+	for _, row := range manifest.Rows {
+		members = append(members, row.MemberID)
+	}
+	slices.Sort(members)
+	slices.Sort(taskIDs)
+	if !slices.Equal(members, taskIDs) {
+		t.Fatalf("drained members = %v, want the implementation tasks %v", members, taskIDs)
+	}
+	if got := mustGetBead(t, store, rootID).Metadata["gc.input_convoy_id"]; got != inputConvoyID {
+		t.Fatalf("root gc.input_convoy_id = %q, want it left at %q", got, inputConvoyID)
+	}
+}
+
+// TestProcessDrainFallsBackToInputConvoyWithoutDrainConvoyID pins the fallback
+// an older pack relies on: with gc.drain_convoy_id unset or blank, the drain
+// scatters gc.input_convoy_id exactly as before the key existed.
+func TestProcessDrainFallsBackToInputConvoyWithoutDrainConvoyID(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		set   bool
+		value string
+	}{{name: "unset"}, {name: "blank", set: true, value: "  "}} {
+		t.Run(tc.name, func(t *testing.T) {
+			formulatest.EnableV2ForTest(t)
+			dir := t.TempDir()
+			writeDrainItemFormula(t, dir)
+			store, drain := seedDrainWorkflow(t)
+			rootID := drain.Metadata["gc.root_bead_id"]
+			if tc.set {
+				if err := store.SetMetadata(rootID, beadmeta.DrainConvoyIDMetadataKey, tc.value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			inputConvoyID := mustGetBead(t, store, rootID).Metadata["gc.input_convoy_id"]
+
+			if _, err := ProcessControl(beadstest.Graph(store), drain, ProcessOptions{Work: beadstest.Work(store), FormulaSearchPaths: []string{dir}}); err != nil {
+				t.Fatalf("ProcessControl(drain expand): %v", err)
+			}
+			manifest := mustDrainManifest(t, mustGetBead(t, store, drain.ID))
+			if manifest.ParentConvoyID != inputConvoyID || len(manifest.Rows) != 2 {
+				t.Fatalf("manifest = parent %q with %d rows, want the input convoy %q with 2", manifest.ParentConvoyID, len(manifest.Rows), inputConvoyID)
+			}
+		})
+	}
+}
+
+// TestProcessDrainFailsWithoutAnyConvoyToScatter pins the error a drain gives
+// when its root names neither gc.drain_convoy_id nor gc.input_convoy_id.
+func TestProcessDrainFailsWithoutAnyConvoyToScatter(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeDrainItemFormula(t, dir)
+	store, drain := seedDrainWorkflow(t)
+	if err := store.SetMetadata(drain.Metadata["gc.root_bead_id"], "gc.input_convoy_id", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ProcessControl(beadstest.Graph(store), drain, ProcessOptions{Work: beadstest.Work(store), FormulaSearchPaths: []string{dir}})
+	if err == nil || !strings.Contains(err.Error(), "missing gc.drain_convoy_id and gc.input_convoy_id") {
+		t.Fatalf("ProcessControl(drain without convoy) error = %v, want one naming both keys", err)
+	}
+}
+
 func TestProcessDrainSeparateFailsClosedWhenMaxUnitsExceeded(t *testing.T) {
 	formulatest.EnableV2ForTest(t)
 	dir := t.TempDir()

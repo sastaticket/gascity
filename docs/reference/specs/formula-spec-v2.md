@@ -907,8 +907,14 @@ The control bead keeps the original step ID (kind `retry`); attempts are
 
 `[steps.drain]` is the canonical v2 fan-out: it scatters the input convoy
 into one-member unit convoys and runs an item formula per unit. A drain
-step forces a targeted invocation, and the item formula must itself
-declare the v2 contract — both at invocation
+scatters the workflow root's `gc.drain_convoy_id` instead when that is set,
+so a workflow that mints its work list mid-run (a decompose step's
+implementation convoy) points the drain there and leaves
+`gc.input_convoy_id` alone. That key names the work the run serves: a run
+whose input convoy work is all terminal is retired, its open steps closed
+skipped, so re-pointing it at a convoy the run itself closes ends the run
+early. A drain step forces a targeted invocation, and the item formula must
+itself declare the v2 contract — both at invocation
 (`drain item formula "<item>" for v2 formula "<parent>" must declare the
 formulas v2 contract ([requires] formula_compiler = ">=2.0.0")`) and again
 at runtime.
