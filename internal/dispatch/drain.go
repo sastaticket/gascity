@@ -86,12 +86,14 @@ func processDrain(store beads.GraphStore, bead beads.Bead, opts ProcessOptions) 
 // drainSourceConvoyID is the convoy a drain in root's workflow scatters: the
 // root's gc.drain_convoy_id when set, else its gc.input_convoy_id. The two are
 // kept apart because gc.input_convoy_id also means the work the workflow
-// serves: the claim hook retires a workflow, and convoy autoclose reaps its
-// root, once every member of that convoy is terminal. A workflow that points
-// gc.input_convoy_id at a convoy it minted mid-run (its implementation tasks)
-// is retired as soon as those close, before the steps after the drain run.
-// Pointing gc.drain_convoy_id there instead leaves the input naming the work
-// served, so the run lives until that work is done.
+// serves: once every member of that convoy is terminal, the claim hook retires
+// the workflow, closing its root and skipping its open steps. (Convoy autoclose
+// finds roots through the same key but leaves open a workflow whose steps are
+// still in flight.) A workflow that points gc.input_convoy_id at a convoy it
+// minted mid-run (its implementation tasks) is retired as soon as those close,
+// before the steps after the drain run. Pointing gc.drain_convoy_id there
+// instead leaves the input naming the work served, so the run lives until that
+// work is done.
 func drainSourceConvoyID(root beads.Bead) string {
 	if id := strings.TrimSpace(root.Metadata[beadmeta.DrainConvoyIDMetadataKey]); id != "" {
 		return id
