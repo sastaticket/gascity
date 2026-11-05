@@ -456,8 +456,8 @@ func TestDoHookClaimStillClaimsWhenInputNotDone(t *testing.T) {
 //
 // The drain must scatter the implementation convoy, and the run must survive
 // that convoy closing: the claim hook retires a workflow once its input
-// convoy's work is terminal, and convoy autoclose reaps a root through the
-// same key. A pack that re-pointed gc.input_convoy_id at the implementation
+// convoy's work is terminal (convoy autoclose finds candidate roots through
+// the same key, but leaves a workflow open while its steps are in flight). A pack that re-pointed gc.input_convoy_id at the implementation
 // convoy so the drain could find it had every step after the drain closed
 // skipped ("input convoy work already terminal") the moment the last task
 // closed. gc.drain_convoy_id names the convoy to drain without touching the
