@@ -197,6 +197,7 @@ const (
 	DrainContextMetadataKey              = "gc.drain_context"
 	DrainContinuationGroupMetadataKey    = "gc.drain_continuation_group"
 	DrainControlIDMetadataKey            = "gc.drain_control_id"
+	DrainConvoyIDMetadataKey             = "gc.drain_convoy_id" // on a workflow root: the convoy its drain scatters, else gc.input_convoy_id (dispatch.drainSourceConvoyID)
 	DrainCountMetadataKey                = "gc.drain_count"
 	DrainFormulaMetadataKey              = "gc.drain_formula"
 	DrainIndexMetadataKey                = "gc.drain_index"
@@ -641,6 +642,7 @@ var KnownMetadataKeys = []string{
 	DrainContextMetadataKey,
 	DrainContinuationGroupMetadataKey,
 	DrainControlIDMetadataKey,
+	DrainConvoyIDMetadataKey,
 	DrainCountMetadataKey,
 	DrainFormulaMetadataKey,
 	DrainIndexMetadataKey,
