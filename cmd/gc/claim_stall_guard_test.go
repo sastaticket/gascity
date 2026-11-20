@@ -1248,3 +1248,110 @@ func TestClaimStallLegacyPassKeepsTheProbeDesired(t *testing.T) {
 		t.Fatalf("desired %v with the probe awake, want the probe %s", desiredNames(ds), name)
 	}
 }
+
+// A control dispatcher's seat is not a claiming worker (stw-flsc): it runs a
+// ralph check in place and leaves the gate bead open, so every seat of it
+// that wakes, outlives the claim deadline and is drained without a claim
+// reads as a claim failure. Three in a row tripped a stall that withheld the
+// gate bead from demand. A dispatcher seat counts toward no stall, its
+// demand is never withheld, and the ladder's unanswered-trigger escalation
+// about it counts for nothing.
+func TestClaimStallGuardIgnoresAControlDispatcher(t *testing.T) {
+	const dispatcher = "kargah/core.control-dispatcher"
+	h := newClaimStallHarness(t)
+	cfg := stallConfig(stallProvider)
+	cfg.Agents = append(cfg.Agents, controlDispatcherTestAgent())
+	h.guard.configure(cfg)
+	h.demand[dispatcher] = []string{"gate-1", "gate-2", "gate-3", "gate-4"}
+	for _, gate := range h.demand[dispatcher] {
+		s := h.spawn(dispatcher, gate)
+		h.advance(30 * time.Second)
+		h.wake(s)
+		woke := h.now
+		h.pass(dispatcher)
+		h.advance(claimStallDeadline)
+		h.pass(dispatcher)
+		h.escalate(s)
+		h.advance(8 * time.Minute)
+		h.close(s, "drained", woke)
+	}
+	if len(h.stalls()) != 0 {
+		t.Fatalf("control dispatcher seats tripped a stall: %v", h.stalls())
+	}
+	if got := h.pass(dispatcher); !reflect.DeepEqual(got, h.demand[dispatcher]) {
+		t.Fatalf("dispatcher demand %v, want all of %v kept", got, h.demand[dispatcher])
+	}
+}
+
+// A config that newly names a template as a control dispatcher ends that
+// template's stall (stw-flsc): a stall held on it before is resumed with
+// cause config_changed, its demand counts again, and its seats from then on
+// count toward no new stall.
+func TestClaimStallGuardForgetsATemplateThatBecomesAControlDispatcher(t *testing.T) {
+	const dispatcher = "kargah/core.control-dispatcher"
+	h := newClaimStallHarness(t)
+	h.demand[dispatcher] = []string{"gate-1", "gate-2", "gate-3", "gate-4"}
+	overdue := func(gate string) stallSeat {
+		s := h.spawn(dispatcher, gate)
+		h.advance(30 * time.Second)
+		h.wake(s)
+		h.pass(dispatcher)
+		h.advance(claimStallDeadline)
+		h.pass(dispatcher)
+		return s
+	}
+	for _, gate := range []string{"gate-1", "gate-2", "gate-3"} {
+		overdue(gate)
+	}
+	if len(h.stalls()) != 1 {
+		t.Fatalf("stalls = %d before the dispatcher is configured, want the unexempt template to trip", len(h.stalls()))
+	}
+	cfg := stallConfig(stallProvider)
+	cfg.Agents = append(cfg.Agents, controlDispatcherTestAgent())
+	h.guard.configure(cfg)
+	resumed := h.ofType(events.AgentClaimsResumed)
+	if len(resumed) != 1 || stallPayload(t, resumed[0]).Cause != events.AgentClaimsCauseConfigChanged {
+		t.Fatalf("resumed %v, want the config change to end the dispatcher's stall", resumed)
+	}
+	if got := h.pass(dispatcher); !reflect.DeepEqual(got, h.demand[dispatcher]) {
+		t.Fatalf("dispatcher demand %v after the config change, want all of %v", got, h.demand[dispatcher])
+	}
+	for _, gate := range []string{"gate-1", "gate-2", "gate-3", "gate-4"} {
+		overdue(gate)
+	}
+	if len(h.stalls()) != 1 {
+		t.Fatalf("stalls = %d, want no new stall once the template is a dispatcher", len(h.stalls()))
+	}
+}
+
+// Seats the guard already holds for a template that the config newly names a
+// control dispatcher are dropped with its state (stw-flsc, review R2): seats
+// awake at the change and overdue after it count toward no stall.
+func TestClaimStallGuardDropsTheSeatsOfANewlyExemptTemplate(t *testing.T) {
+	const dispatcher = "kargah/core.control-dispatcher"
+	h := newClaimStallHarness(t)
+	h.demand[dispatcher] = []string{"gate-1", "gate-2", "gate-3"}
+	// Woken a minute apart, so their failures would span claimStallMinSpan
+	// and trip a stall if the guard still held them.
+	var live []stallSeat
+	for i, gate := range h.demand[dispatcher] {
+		if i > 0 {
+			h.advance(time.Minute)
+		}
+		s := h.spawn(dispatcher, gate)
+		h.wake(s)
+		live = append(live, s)
+	}
+	h.pass(dispatcher)
+	cfg := stallConfig(stallProvider)
+	cfg.Agents = append(cfg.Agents, controlDispatcherTestAgent())
+	h.guard.configure(cfg)
+	h.advance(claimStallDeadline + time.Minute)
+	h.pass(dispatcher)
+	for _, s := range live {
+		h.close(s, "drained", s.created)
+	}
+	if len(h.stalls()) != 0 {
+		t.Fatalf("seats held from before the change tripped a stall: %v", h.stalls())
+	}
+}

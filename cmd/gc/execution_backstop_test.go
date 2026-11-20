@@ -1762,3 +1762,26 @@ func TestExecutionBackstopANewClaimStartsWithoutTheOldLatch(t *testing.T) {
 		t.Fatalf("latch token after B's escalation = %q, want incarnation-1", got)
 	}
 }
+
+// A control dispatcher's seat holding an in-progress assignment is no
+// claiming worker either (stw-flsc, review R3): the execution backstop never
+// paces it, nudges it or drains it, whatever the claim's age, and wipes any
+// pacing marker left on it.
+func TestExecutionBackstopLeavesAControlDispatcherAlone(t *testing.T) {
+	f := newExecutionBackstopFixture(t)
+	f.cfg.Agents = append(f.cfg.Agents, controlDispatcherTestAgent())
+	f.setSessionMeta(t, map[string]string{"template": "kargah/core.control-dispatcher", executionClaimNudgeWorkKey: f.work.ID})
+	f.idleFor(t, 10*time.Minute)
+	f.tick(t)
+	if got := f.sessionMeta(t, executionClaimNudgeWorkKey); got != "" {
+		t.Fatalf("work marker = %q after a tick, want the old pacing wiped", got)
+	}
+	for i := 0; i < idleClaimNudgeMaxAttempts+3; i++ {
+		f.now = f.now.Add(idleClaimNudgeGrace + idleClaimNudgeBackoff)
+		f.idleFor(t, 10*time.Minute)
+		f.tick(t)
+	}
+	if f.nudgeCount() != 0 || len(f.drained) != 0 || f.stalledEvents() != 0 {
+		t.Fatalf("nudges %d drains %v stalled %d, want the dispatcher left alone; stdout=%s", f.nudgeCount(), f.drained, f.stalledEvents(), f.stdout.String())
+	}
+}

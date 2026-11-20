@@ -70,7 +70,7 @@ func ladderProvider(row beads.Bead) string {
 func buildLadderFreshIndex(raw []beads.Bead) ladderFreshIndex {
 	x := ladderFreshIndex{}
 	for _, row := range raw {
-		if !ladderGoverns(row) {
+		if !ladderSeat(row) {
 			continue
 		}
 		r, err := workladder.DecodeLadder(row.Metadata[session.WorkLadderKey])
