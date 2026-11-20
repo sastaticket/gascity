@@ -1214,3 +1214,147 @@ func TestNudgeStalledPoolClaims_DrainReadsTheLiveTurn(t *testing.T) {
 		})
 	}
 }
+
+// controlDispatcherTestAgent is a rig's deterministic control dispatcher as
+// the core pack expands it: providerless, its start command the serve loop.
+func controlDispatcherTestAgent() config.Agent {
+	return config.Agent{
+		Name:         config.ControlDispatcherAgentName,
+		Dir:          "kargah",
+		BindingName:  "core",
+		StartCommand: config.ControlDispatcherStartCommandFor("kargah/core.control-dispatcher"),
+	}
+}
+
+// controlDispatcherTestCfg is idleClaimTestCfg with the rig's dispatcher.
+func controlDispatcherTestCfg() *config.City {
+	cfg := idleClaimTestCfg()
+	cfg.Agents = append(cfg.Agents, controlDispatcherTestAgent())
+	return cfg
+}
+
+// Kills the control dispatcher drained mid-check (stw-flsc): the dispatcher
+// runs a ralph check in place for up to 30 minutes, its trigger the gate bead
+// left open and unassigned and its sh pane silent throughout. The claim
+// backstop reads that as a seat that never claimed and drains it at about 11
+// minutes, so a long check restarts forever. A dispatcher seat is not a
+// claiming worker: no nudge, no drain, no marker over a 30-minute check. A
+// worker seat in the same state is still nudged and drained.
+func TestNudgeStalledPoolClaims_LeavesAControlDispatcherRunningACheck(t *testing.T) {
+	for _, tc := range []struct {
+		name, template string
+		wantDrained    bool
+	}{
+		{name: "control dispatcher", template: "kargah/core.control-dispatcher"},
+		{name: "worker", template: "agent-a", wantDrained: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			s := idleClaimPoolSession()
+			s.Metadata["template"] = tc.template
+			s.Metadata["instance_token"] = "tok-1"
+			store := beads.NewMemStoreFrom(0, []beads.Bead{s, {ID: "work-a", Status: "open"}}, nil)
+			open := []beads.Bead{{ID: "work-a", Status: "open"}}
+			drains := &drainRecorder{}
+			var out bytes.Buffer
+			sp := quietClaimFake(t, base)
+			cfg := controlDispatcherTestCfg()
+			for at := base; !at.After(base.Add(30 * time.Minute)); at = at.Add(15 * time.Second) {
+				sp.SetActivity("session-a", at.Add(-time.Hour))
+				nudgeStalledPoolClaims(sp, cfg, store, []beads.Bead{mustGetTestBead(t, store, s.ID)}, open, nil, at, liveClaimDrain(store, drains.request), &out)
+			}
+			got := mustGetTestBead(t, store, s.ID)
+			nudges := sp.CountCalls("Nudge", "session-a")
+			if !tc.wantDrained {
+				if nudges != 0 || len(drains.ids) != 0 || got.Metadata[idleClaimNudgeTriggerKey] != "" || got.Metadata[idleClaimNudgeStalledKey] != "" {
+					t.Fatalf("nudges %d drains %v metadata %v, want the dispatcher left alone; log %q", nudges, drains.ids, got.Metadata, out.String())
+				}
+				return
+			}
+			if nudges != idleClaimNudgeMaxAttempts || len(drains.ids) != 1 || drains.ids[0] != s.ID {
+				t.Fatalf("nudges %d drains %v, want %d nudges and one drain for a worker; log %q", nudges, drains.ids, idleClaimNudgeMaxAttempts, out.String())
+			}
+		})
+	}
+}
+
+// The continuation backstop's seats are claiming workers too: a control
+// dispatcher seat holding a pinned continuation resolves clear, so the engine
+// neither nudges nor drains it and wipes any pacing left on it, while a worker
+// seat in the same state is outstanding (stw-flsc).
+func TestPoolContinuationBackstop_ClearsAControlDispatcher(t *testing.T) {
+	for _, tc := range []struct {
+		template string
+		want     backstopResolution
+	}{
+		{template: "kargah/core.control-dispatcher", want: backstopResolutionClear},
+		{template: "agent-a", want: backstopResolutionOutstanding},
+	} {
+		s := idleClaimPoolSession()
+		s.Metadata["template"] = tc.template
+		s.Metadata["generation"] = "7"
+		b := poolContinuationBackstop{cfg: controlDispatcherTestCfg(), candidates: poolContinuationCandidateSnapshot{
+			bySessionID: map[string][]ContinuationClaimCandidate{s.ID: {{WorkBeadID: "work-a", Assignee: "session-a"}}},
+		}}
+		if _, got := b.resolve(s, nil, "session-a"); got != tc.want {
+			t.Fatalf("%s: resolution %v, want %v", tc.template, got, tc.want)
+		}
+	}
+}
+
+// Kills pacing left on a control dispatcher from before its exemption
+// (stw-flsc, review R1): a dispatcher seat at the nudge cap with its trigger
+// still open has its marker wiped on the next tick, and is neither nudged nor
+// drained.
+func TestNudgeStalledPoolClaims_ClearsAControlDispatchersOldPacing(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	s := atCapSession(base, "tok-1")
+	s.Metadata["template"] = "kargah/core.control-dispatcher"
+	store := beads.NewMemStoreFrom(0, []beads.Bead{s, {ID: "work-a", Status: "open"}}, nil)
+	open := []beads.Bead{{ID: "work-a", Status: "open"}}
+	drains := &drainRecorder{}
+	var out bytes.Buffer
+	now := base.Add(idleClaimNudgeBackoff + time.Second)
+	sp := quietClaimFake(t, now)
+	nudgeStalledPoolClaims(sp, controlDispatcherTestCfg(), store, []beads.Bead{s}, open, nil, now, liveClaimDrain(store, drains.request), &out)
+	got := mustGetTestBead(t, store, s.ID)
+	if len(drains.ids) != 0 || sp.CountCalls("Nudge", "session-a") != 0 || got.Metadata[idleClaimNudgeTriggerKey] != "" || got.Metadata[idleClaimNudgeCountKey] != "" {
+		t.Fatalf("drains %v nudges %d metadata %v, want the old pacing wiped and nothing delivered; log %q",
+			drains.ids, sp.CountCalls("Nudge", "session-a"), got.Metadata, out.String())
+	}
+}
+
+// isControlDispatcherSeat resolves the seat's template through the config
+// and asks config.IsDeterministicControlDispatcher: rig and binding forms of
+// the dispatcher are seats of it; a model agent given the reserved name, an
+// ordinary shell seat and a template the config does not name are not.
+func TestIsControlDispatcherSeat(t *testing.T) {
+	city := config.Agent{Name: config.ControlDispatcherAgentName, StartCommand: config.ControlDispatcherStartCommand}
+	bound := config.Agent{Name: config.ControlDispatcherAgentName, BindingName: "core", StartCommand: config.ControlDispatcherStartCommandFor("core.control-dispatcher")}
+	rigUnbound := config.Agent{Name: config.ControlDispatcherAgentName, Dir: "qa", StartCommand: config.ControlDispatcherStartCommandFor("qa/control-dispatcher")}
+	modelNamed := config.Agent{Name: config.ControlDispatcherAgentName, Dir: "model", Provider: "claude"}
+	shell := config.Agent{Name: "lint", Dir: "kargah", StartCommand: "sh -c 'make lint'"}
+	cfg := &config.City{Agents: []config.Agent{city, bound, rigUnbound, controlDispatcherTestAgent(), modelNamed, shell, {Name: "agent-a"}}}
+	for _, tc := range []struct {
+		template string
+		want     bool
+	}{
+		{"control-dispatcher", true},
+		{"core.control-dispatcher", true},
+		{"qa/control-dispatcher", true},
+		{"kargah/core.control-dispatcher", true},
+		{"model/control-dispatcher", false},
+		{"kargah/lint", false},
+		{"agent-a", false},
+		{"gone/core.control-dispatcher", false},
+	} {
+		s := idleClaimPoolSession()
+		s.Metadata["template"] = tc.template
+		if got := isControlDispatcherSeat(cfg, s); got != tc.want {
+			t.Errorf("template %q: %v, want %v", tc.template, got, tc.want)
+		}
+	}
+	if isControlDispatcherSeat(nil, idleClaimPoolSession()) {
+		t.Errorf("a nil config named a dispatcher seat")
+	}
+}

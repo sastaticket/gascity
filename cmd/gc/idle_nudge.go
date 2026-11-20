@@ -260,7 +260,30 @@ func (p poolContinuationBackstop) governs(s beads.Bead) bool {
 	return strings.TrimSpace(s.Metadata["pool_managed"]) == "true"
 }
 
+// isControlDispatcherSeat reports whether session bead s is a seat of a
+// deterministic control dispatcher (config.IsDeterministicControlDispatcher),
+// resolved from its template through cfg. Such a seat is pool-managed but is
+// no claiming worker: it runs control beads, ralph checks included, in place
+// and leaves them open and unassigned for as long as a check takes (up to 30
+// minutes), its pane silent throughout. The claim, continuation and
+// execution backstops, the claims-stall guard and the work ladder, which all
+// read an unclaimed or unstarted claim on a quiet seat as a wedged worker,
+// leave it alone (stw-flsc).
+//
+// The backstops still govern such a seat but resolve it as clear: the engine
+// then never nudges or drains it, and its clear path wipes pacing an earlier
+// pass left on the row and withdraws that pacing's open notices.
+func isControlDispatcherSeat(cfg *config.City, s beads.Bead) bool {
+	if cfg == nil {
+		return false
+	}
+	return config.IsDeterministicControlDispatcher(findAgentByTemplate(cfg, normalizedSessionTemplate(s, cfg)))
+}
+
 func (p poolContinuationBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, _ string) (backstopTarget, backstopResolution) {
+	if isControlDispatcherSeat(p.cfg, s) {
+		return backstopTarget{}, backstopResolutionClear
+	}
 	if p.candidates.holdBySessionID[s.ID] {
 		return backstopTarget{}, backstopResolutionHold
 	}
@@ -531,7 +554,7 @@ func (p poolClaimBackstop) governs(s beads.Bead) bool {
 // rig's copy, not a same-ID bead in another store.
 func (p poolClaimBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, _ string) (backstopTarget, backstopResolution) {
 	triggerID := strings.TrimSpace(s.Metadata[beadmeta.TriggerBeadIDMetadataKey])
-	if triggerID == "" {
+	if triggerID == "" || isControlDispatcherSeat(p.cfg, s) {
 		return backstopTarget{}, backstopResolutionClear
 	}
 	w, ok := p.work.lookup(triggerID, s.Metadata[beadmeta.TriggerBeadStoreRefMetadataKey])

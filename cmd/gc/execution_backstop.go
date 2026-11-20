@@ -346,6 +346,9 @@ func (p poolExecutionBackstop) governs(s beads.Bead) bool {
 // nudge about would make the persisted marker a lie. Ambiguity holds rather than
 // clears, so a transient multi-claim tick cannot reset a window already running.
 func (p poolExecutionBackstop) resolve(s beads.Bead, _ map[string]beads.Bead, sessName string) (backstopTarget, backstopResolution) {
+	if isControlDispatcherSeat(p.cfg, s) {
+		return backstopTarget{}, backstopResolutionClear // stw-flsc: no claiming worker
+	}
 	claims := p.claims.forIdentities(currentSessionAssigneeIdentities(s))
 	switch len(claims) {
 	case 0:

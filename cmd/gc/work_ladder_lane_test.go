@@ -1928,3 +1928,50 @@ func (c *ladderCity) namesake(id string, meta map[string]string) {
 		return s
 	}
 }
+
+// The ladder paces the seats the backstops governed, and a control
+// dispatcher's seat is not one (stw-flsc): it runs its checks in place and
+// claims nothing, so the ladder would escalate and recycle it as a seat that
+// never answered its trigger.
+func TestLadderGovernsNoControlDispatcher(t *testing.T) {
+	cfg := controlDispatcherTestCfg()
+	row := func(template string) beads.Bead {
+		return beads.Bead{ID: "s-" + template, Status: "open", Type: sessionBeadType, Metadata: map[string]string{
+			"pool_managed": "true", "session_name": "seat", "template": template,
+		}}
+	}
+	if ladderGoverns(cfg, row("kargah/core.control-dispatcher")) {
+		t.Fatalf("the ladder governs the control dispatcher seat")
+	}
+	if !ladderGoverns(cfg, row("agent-a")) {
+		t.Fatalf("the ladder does not govern a worker seat")
+	}
+}
+
+// With the ladder on, a control dispatcher's seat checking its trigger in
+// place for 30 minutes is never nudged, escalated or recycled (stw-flsc),
+// where a worker's is recycled within 25 (TestWorkLadderRecyclesAnUnclaimedTrigger);
+// and a release an earlier governed pass left in its cell is dropped, so the
+// hook does not refuse a claim for good (review R1).
+func TestWorkLadderLeavesAControlDispatcherAlone(t *testing.T) {
+	c := newLadderCity(t)
+	c.env.Cfg.Agents = append(c.env.Cfg.Agents, controlDispatcherTestAgent())
+	id := c.claim("left from before")
+	key := workladder.ClaimKey{Store: "city", Bead: id}
+	cell := workladder.Record{V: 1, Gen: 7, Release: &workladder.ReleaseMark{Key: key, Gen: 7, At: c.now}}
+	c.setRow(map[string]string{"template": "kargah/core.control-dispatcher", session.WorkLadderKey: workladder.EncodeLadder(cell)})
+	c.pass()
+	if session.WorkLadderReleases(c.row().Metadata[session.WorkLadderKey], "city", id) {
+		t.Fatal("the release left on the dispatcher's cell outlived its exemption")
+	}
+	b, err := c.work.Create(beads.Bead{Title: "gate", Type: "task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.trigger = b.ID
+	c.setRow(map[string]string{beadmeta.TriggerBeadIDMetadataKey: b.ID})
+	c.run(30*time.Minute, 30*time.Second, nil)
+	if len(c.nudgedAt) != 0 || len(c.posted) != 0 || len(escalations(c)) != 0 {
+		t.Fatalf("nudges %v posted %+v escalations %v, want the dispatcher left alone", c.nudgedAt, c.posted, escalations(c))
+	}
+}
