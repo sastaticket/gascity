@@ -162,6 +162,10 @@ type claimStallGuard struct {
 	record    func(events.Event)
 	stderr    io.Writer
 	providers map[string]string // template → the provider its seats run on now
+	// exempt is the templates that are deterministic control dispatchers
+	// (isControlDispatcherSeat): their seats run checks in place and claim
+	// nothing, so none of them is counted (stw-flsc).
+	exempt    map[string]struct{}
 	templates map[string]*claimStallTemplate
 	seats     map[string]*claimStallSeat
 	// waitedBy is the routed demand's reverse index: a waiting bead → the
@@ -186,6 +190,7 @@ func newClaimStallGuard(record func(events.Event), stderr io.Writer) *claimStall
 		record:    record,
 		stderr:    stderr,
 		providers: map[string]string{},
+		exempt:    map[string]struct{}{},
 		templates: map[string]*claimStallTemplate{},
 		seats:     map[string]*claimStallSeat{},
 		waitedBy:  map[string]map[string]struct{}{},
@@ -215,18 +220,28 @@ func claimStallProviders(cfg *config.City) map[string]string {
 // configure adopts cfg's templates. A template that moved to another provider
 // starts a new epoch on it: the move may have been the fix, so its stall ends
 // (agent.claims_resumed, cause config_changed) and its streak is dropped. A
-// template gone from the config is forgotten.
+// template gone from the config, or exempt from the guard, is forgotten.
 func (g *claimStallGuard) configure(cfg *config.City) {
 	if g == nil {
 		return
 	}
 	providers := claimStallProviders(cfg)
+	exempt := claimStallExempt(cfg)
 	now := g.now()
 	var alerts []events.Event
 	g.mu.Lock()
 	g.providers = providers
+	g.exempt = exempt
+	for id, seat := range g.seats {
+		if _, skip := exempt[seat.template]; skip {
+			delete(g.seats, id)
+		}
+	}
 	for name, t := range g.templates {
 		provider, ok := providers[name]
+		if _, skip := exempt[name]; skip {
+			ok = false
+		}
 		if ok && provider == t.provider {
 			continue
 		}
@@ -242,6 +257,21 @@ func (g *claimStallGuard) configure(cfg *config.City) {
 	}
 	g.mu.Unlock()
 	g.emit(alerts)
+}
+
+// claimStallExempt is cfg's deterministic control dispatchers, by qualified
+// name: the templates whose seats the guard never counts.
+func claimStallExempt(cfg *config.City) map[string]struct{} {
+	out := map[string]struct{}{}
+	if cfg == nil {
+		return out
+	}
+	for i := range cfg.Agents {
+		if config.IsDeterministicControlDispatcher(&cfg.Agents[i]) {
+			out[cfg.Agents[i].QualifiedName()] = struct{}{}
+		}
+	}
+	return out
 }
 
 // templateFor is name's state, created on first use. Caller holds g.mu.
@@ -330,6 +360,9 @@ func (g *claimStallGuard) observeSeat(b beads.Bead, closed bool, at time.Time) [
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if _, skip := g.exempt[template]; skip {
+		return nil
+	}
 	g.sweep(at)
 	_, known := g.seats[b.ID]
 	seat := g.seatFor(b.ID, template)
@@ -439,6 +472,9 @@ func (g *claimStallGuard) observeUnanswered(sessionID, template, trigger string,
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if _, skip := g.exempt[template]; skip {
+		return nil
+	}
 	g.sweep(at)
 	seat := g.seatFor(sessionID, template)
 	seat.seen = at

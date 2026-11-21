@@ -141,7 +141,14 @@ func (l *externalReadsLane) runWorkLadder(ctx context.Context, env externalReads
 		if ctx.Err() != nil {
 			return
 		}
-		if !ladderGoverns(row) {
+		if !ladderGoverns(p.cfg, row) {
+			if ladderSeat(row) {
+				// A control dispatcher's seat (stw-flsc): settle what an
+				// earlier governed pass left in its cell, so a pending
+				// release cannot keep the hook refusing a claim for good.
+				// Never nudges, releases or recycles.
+				p.standDownSeat(row, workladder.Gate{Held: true, Reason: "control_dispatcher"})
+			}
 			continue
 		}
 		governed[row.ID] = true
@@ -150,9 +157,17 @@ func (l *externalReadsLane) runWorkLadder(ctx context.Context, env externalReads
 	l.ladderTurns.keep(governed)
 }
 
-// ladderGoverns is the seats the ladder paces: open pool-managed session
-// rows with a runtime name, as the backstops governed.
-func ladderGoverns(row beads.Bead) bool {
+// ladderGoverns is the seats the ladder paces: its seats (ladderSeat) less
+// a control dispatcher's, as the backstops governed (isControlDispatcherSeat).
+func ladderGoverns(cfg *config.City, row beads.Bead) bool {
+	return ladderSeat(row) && !isControlDispatcherSeat(cfg, row)
+}
+
+// ladderSeat is every seat the ladder may have written a cell on: open
+// pool-managed session rows with a runtime name. Standing the ladder down and
+// reading its fresh restarts go over all of them, so a cell written on a seat
+// before it stopped being governed is still cleared and read.
+func ladderSeat(row beads.Bead) bool {
 	return !strings.EqualFold(strings.TrimSpace(row.Status), "closed") && isSessionBead(row) &&
 		strings.TrimSpace(row.Metadata["pool_managed"]) == "true" && strings.TrimSpace(row.Metadata["session_name"]) != ""
 }
@@ -169,38 +184,45 @@ func (l *externalReadsLane) standDownLadder(env externalReadsEnv, raw []beads.Be
 	p := &ladderPass{l: l, env: env, cfg: env.Cfg, now: l.now(), front: sessionFrontDoor(env.CityStore)}
 	off := workladder.Gate{Held: true, Reason: "work_ladder_off"}
 	for _, row := range raw {
-		if !ladderGoverns(row) {
-			continue
+		if ladderSeat(row) {
+			p.standDownSeat(row, off)
 		}
-		r, err := workladder.DecodeLadder(row.Metadata[session.WorkLadderKey])
+	}
+}
+
+// standDownSeat hands one seat's cell back under the held gate off: by one
+// CAS it drops the pending release and folds in its notices' fates,
+// withdrawing each notice still pending. It writes nothing when the cell
+// holds neither, and never nudges, releases or recycles.
+func (p *ladderPass) standDownSeat(row beads.Bead, off workladder.Gate) {
+	r, err := workladder.DecodeLadder(row.Metadata[session.WorkLadderKey])
+	if err != nil {
+		return
+	}
+	outs := p.noticeOutcomes(row, r, off)
+	if r.Release == nil && len(outs) == 0 {
+		return
+	}
+	var settled []ladderSettled
+	wrote, err := p.front.UpdateRowFenced(row.ID, workLadderCommitAttempts, func(_ session.Info, resp session.PersistedResponse) (session.RowPatch, bool) {
+		r, err := workladder.DecodeLadder(resp.Metadata[session.WorkLadderKey])
 		if err != nil {
-			continue
+			return session.RowPatch{}, false
 		}
-		outs := p.noticeOutcomes(row, r, off)
-		if r.Release == nil && len(outs) == 0 {
-			continue
+		r, settled = foldLadderNotices(r, outs)
+		if r.Release == nil && len(settled) == 0 {
+			return session.RowPatch{}, false
 		}
-		var settled []ladderSettled
-		wrote, err := p.front.UpdateRowFenced(row.ID, workLadderCommitAttempts, func(_ session.Info, resp session.PersistedResponse) (session.RowPatch, bool) {
-			r, err := workladder.DecodeLadder(resp.Metadata[session.WorkLadderKey])
-			if err != nil {
-				return session.RowPatch{}, false
-			}
-			r, settled = foldLadderNotices(r, outs)
-			if r.Release == nil && len(settled) == 0 {
-				return session.RowPatch{}, false
-			}
-			r.Release = nil
-			return session.RowPatch{Metadata: session.MetadataPatch{session.WorkLadderKey: workladder.EncodeLadder(r)}}, true
-		})
-		if err != nil {
-			fmt.Fprintf(l.stderr, "work-ladder: standing down %s's cell: %v\n", row.ID, err) //nolint:errcheck // best-effort stderr
-			continue
-		}
-		if wrote {
-			for _, s := range settled {
-				p.noticeSettled(row, s)
-			}
+		r.Release = nil
+		return session.RowPatch{Metadata: session.MetadataPatch{session.WorkLadderKey: workladder.EncodeLadder(r)}}, true
+	})
+	if err != nil {
+		fmt.Fprintf(p.l.stderr, "work-ladder: standing down %s's cell: %v\n", row.ID, err) //nolint:errcheck // best-effort stderr
+		return
+	}
+	if wrote {
+		for _, s := range settled {
+			p.noticeSettled(row, s)
 		}
 	}
 }
@@ -241,7 +263,7 @@ func (p *ladderPass) outstanding(s *allocSummary, raw []beads.Bead) map[string][
 		}
 	}
 	for _, row := range raw {
-		if !ladderGoverns(row) {
+		if !ladderGoverns(p.cfg, row) {
 			continue
 		}
 		var ts []ladderTarget
